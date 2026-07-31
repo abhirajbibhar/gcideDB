@@ -6,13 +6,22 @@ Merges:
   • Tree-based markup parser (sense-aware, nested tags)
   • Full semantic fields (morphology, taxonomy, WordNet, collocations, …)
   • JSON export (+ optional gzip)
-  • SQLite + FTS5 full-text search
   • Issue log + summary
   • Entity / abbreviation / author resolution
+  • Optional per-letter JSON files (one per CIDE.X source)
 
 Usage:
-  python3 gcide_build.py ./gcide-0.54 dist/gcide.json --pretty --db dist/gcide.db
-  python3 gcide_build.py ./gcide-0.54 dist/gcide.json.gz --letters E,W --db dist/gcide.db
+  python3 gcide_build.py ./gcide-0.54 dist/
+  python3 gcide_build.py ./gcide-0.54 dist/ --letters E,W --pretty
+
+Output directory contains:
+  front_matter.json          # dictionary front matter (once, at the beginning)
+  gcide_A.json … gcide_Z.json  # one section object per letter:
+                               #   { "section_marker": "A", "entries": [...] }
+  gcide.log                  # parse log
+
+No combined/bulky single JSON is written. Markers are never attached to
+individual word entries.
 
 Sidecar files (same directory as this script):
   entity_map.json   Unicode entities
@@ -21,7 +30,7 @@ Sidecar files (same directory as this script):
   authors.json      quote-author → full name
 """
 
-import argparse, gzip, json, os, re, sqlite3, sys, time
+import argparse, gzip, json, os, re, sys, time
 from typing import Any, Dict, List, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -283,28 +292,75 @@ def leading_headwords(ch):
     return words
 
 def is_section_marker(ch):
+    """True for letter running-heads like <centered>A.</centered>, optionally
+    followed by <br/> / [1913 Webster] source tags on the same <p>."""
     real = [c for c in ch if not (isinstance(c, str) and not c.strip())]
-    return len(real) == 1 and is_tag(real[0], "centered")
+    if not real:
+        return False
+    if not is_tag(real[0], "centered"):
+        return False
+    # Allow trailing br / source / source-like noise after the centered head
+    for c in real[1:]:
+        if is_tag(c, "br"):
+            continue
+        if is_tag(c, "source"):
+            continue
+        # anything else means this is not a pure section marker
+        return False
+    return True
+
+def extract_front_quote(ch):
+    """Turn a pre-entry <p> into structured front-matter.
+
+    Handles the standard opening quote:
+      <q>…</q><rj><qau>Locke.</qau></rj>
+    Returns a dict {text, author?, author_info?} or plain text fallback.
+    """
+    q_node = first_tag(ch, "q")
+    if q_node is None:
+        t = clean(text_of(ch))
+        return t if t else None
+
+    # Quote text only (exclude any nested author tags if present)
+    parts = []
+    for c in q_node.get("children", []):
+        if is_any(c, "qau", "au"):
+            continue
+        parts.append(text_of(c))
+    text = clean("".join(parts))
+    if not text:
+        return None
+
+    item: Dict[str, Any] = {"text": text}
+
+    au_node = first_tag(ch, "qau", "au")
+    if au_node is None:
+        au_node = first_tag(q_node.get("children", []), "qau", "au")
+    if au_node is not None:
+        short = clean(text_of(au_node.get("children", [])))
+        if short:
+            item["author"] = short.rstrip(".")  # canonical short key form
+            info = resolve_author(short)
+            if info:
+                item["author_info"] = {
+                    k: v for k, v in info.items() if v not in (None, "", "ND")
+                }
+                # Prefer the full display name as author string
+                item["author"] = info.get("name") or item["author"]
+    return item
+
 
 def segment_entries(top_nodes, letter, log=None):
     entries, front_matter, section_markers, current = [], [], [], None
     for p in (n for n in top_nodes if is_tag(n, "p")):
         ch = p.get("children", [])
         if is_blank(ch):
-            if log is not None:
-                log.append({"letter": letter, "source_file": f"CIDE.{letter}",
-                    "type": "excluded_non_entry", "line": None,
-                    "reason": "blank <p> (page-number marker <p><-- p.N --></p> after comment stripping)",
-                    "context": "(empty)"})
+            # Page-number markers — handled, not logged
             continue
         if is_section_marker(ch):
             t = clean(text_of(ch))
             section_markers.append(t)
-            if log is not None:
-                log.append({"letter": letter, "source_file": f"CIDE.{letter}",
-                    "type": "excluded_non_entry", "line": None,
-                    "reason": "letter-section running-head marker -- saved under 'section_markers'.",
-                    "context": t})
+            # Section markers become section_marker / other_markers — not logged
             continue
         first = first_real(ch)
         if is_tag(first, "ent"):
@@ -313,15 +369,13 @@ def segment_entries(top_nodes, letter, log=None):
                        "letter": letter, "blocks": [ch]}
             entries.append(current)
         else:
-            if current: current["blocks"].append(ch)
+            if current:
+                current["blocks"].append(ch)
             else:
-                t = clean(text_of(ch))
-                front_matter.append(t)
-                if log is not None:
-                    log.append({"letter": letter, "source_file": f"CIDE.{letter}",
-                        "type": "excluded_non_entry", "line": None,
-                        "reason": "front-matter block before first headword -- saved under 'front_matter'.",
-                        "context": t[:200]})
+                # Pre-entry material → structured front matter (not logged)
+                item = extract_front_quote(ch)
+                if item:
+                    front_matter.append(item)
     return entries, front_matter, section_markers
 
 
@@ -794,68 +848,6 @@ def parse_letter(path, letter, log=None):
     return segment_entries(nodes, letter, log=log)
 
 
-def create_db(db_path: str) -> sqlite3.Connection:
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript("""
-        CREATE TABLE entries (
-            id INTEGER PRIMARY KEY,
-            headword TEXT NOT NULL,
-            headword_full TEXT,
-            letter TEXT,
-            homograph INTEGER,
-            part_of_speech TEXT,
-            pronunciation TEXT,
-            field TEXT,
-            etymology TEXT,
-            search_text TEXT,
-            raw_json TEXT NOT NULL
-        );
-        CREATE VIRTUAL TABLE entries_fts USING fts5(
-            headword,
-            search_text,
-            content='entries',
-            content_rowid='id',
-            tokenize='porter unicode61'
-        );
-        CREATE TRIGGER entries_ai AFTER INSERT ON entries BEGIN
-            INSERT INTO entries_fts(rowid, headword, search_text)
-            VALUES (new.id, new.headword, new.search_text);
-        END;
-        CREATE INDEX idx_entries_hw ON entries(headword);
-        CREATE INDEX idx_entries_letter ON entries(letter);
-    """)
-    return conn
-
-
-def search_blob(entry: Dict[str, Any]) -> str:
-    parts = [entry.get("headword") or "", entry.get("headword_full") or ""]
-    if entry.get("etymology"):
-        parts.append(entry["etymology"])
-    for s in entry.get("senses") or []:
-        if s.get("definition"):
-            parts.append(s["definition"])
-        for sd in s.get("sub_defs") or []:
-            if isinstance(sd, dict) and sd.get("definition"):
-                parts.append(sd["definition"])
-            elif isinstance(sd, str):
-                parts.append(sd)
-        for q in s.get("quotations") or []:
-            if isinstance(q, dict):
-                parts.append(q.get("text") or "")
-            else:
-                parts.append(str(q))
-    for c in entry.get("collocations") or []:
-        if isinstance(c, dict):
-            parts.append(c.get("phrase") or c.get("text") or str(c))
-        else:
-            parts.append(str(c))
-    if entry.get("note"):
-        parts.append(entry["note"])
-    return "\n".join(p for p in parts if p)
 
 
 def attach_authors(entry: Dict[str, Any]) -> None:
@@ -878,23 +870,32 @@ def attach_authors(entry: Dict[str, Any]) -> None:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build production GCIDE JSON (+ optional SQLite FTS) for dictionary apps"
+        description="Build production GCIDE JSON for dictionary apps"
     )
     ap.add_argument("source_dir", help="Path to unpacked gcide-0.54 (CIDE.A … CIDE.Z)")
-    ap.add_argument("output", help="Output JSON path (.json or .json.gz)")
-    ap.add_argument("--db", default=None, help="Also write SQLite DB with FTS5 (e.g. gcide.db)")
-    ap.add_argument("--pretty", action="store_true", help="Indent JSON")
+    ap.add_argument("output_dir", help="Output directory for front_matter.json + gcide_A.json … gcide_Z.json")
+    ap.add_argument("--pretty", action="store_true", default=True,
+                    help="Indent JSON (default: on)")
+    ap.add_argument("--compact", action="store_true",
+                    help="Disable pretty-printing (compact JSON)")
     ap.add_argument("--letters", default="", help="Comma letters, e.g. E,W (default: all)")
-    ap.add_argument("--log", default=None, help="Issue log path (default: alongside output)")
+    ap.add_argument("--log", default=None, help="Issue log path (default: output_dir/gcide.log)")
     ap.add_argument("--keep-nulls", action="store_true",
                     help="Keep null/empty fields in JSON (default: drop for compact data)")
     args = ap.parse_args()
+    if args.compact:
+        args.pretty = False
 
     letters = [l.strip().upper() for l in args.letters.split(",") if l.strip()] or LETTERS
-    log_path = args.log or default_log_path(args.output)
+    out_dir = os.path.abspath(args.output_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    log_path = args.log or os.path.join(out_dir, "gcide.log")
     t0 = time.time()
 
     all_entries: List[Dict[str, Any]] = []
+    # Per-letter section payloads (no front_matter — that is dictionary-level only)
+    by_letter: Dict[str, Dict[str, Any]] = {}
+    dict_front_matter: List[Any] = []  # structured quotes once at dictionary start
     log_events: List[Dict[str, Any]] = []
 
     print(f"Entity map : {len(ENTITY_MAP)}  webchr: {len(WEBCHR_MAP)}", file=sys.stderr)
@@ -906,8 +907,9 @@ def main():
             print(f"  !! {path} not found, skipping", file=sys.stderr)
             continue
         print(f"Parsing CIDE.{letter} ...", file=sys.stderr)
-        entries, _fm, _sm = parse_letter(path, letter, log=log_events)
+        entries, front_matter, section_markers = parse_letter(path, letter, log=log_events)
 
+        letter_entries: List[Dict[str, Any]] = []
         seen: Dict[str, int] = {}
         for e in entries:
             hw = e["headword"]
@@ -916,57 +918,68 @@ def main():
             attach_authors(obj)
             if not args.keep_nulls:
                 obj = drop_nulls(obj)
+            letter_entries.append(obj)
             all_entries.append(obj)
 
-        print(f"  {letter}: {len(entries)} entries", file=sys.stderr)
+        # One top-level section marker per alphabet letter (A, B, C, …).
+        # Front matter is collected once at the dictionary root (not per letter).
+        # Running-head text from the source (e.g. "NUMBERS.") kept as extras only.
+        extras = [m for m in (section_markers or [])
+                  if m.rstrip(".") != letter]
+        payload: Dict[str, Any] = {
+            "section_marker": letter,          # once per alphabet section
+            "entries": letter_entries,
+        }
+        if extras:
+            payload["other_markers"] = extras  # e.g. "NUMBERS." under A
+        by_letter[letter] = payload
+        # Capture genuine front matter once at dictionary start (A has the Locke
+        # quote; F repeats it — skip duplicates). Ignore letter-head leftovers.
+        for fm in (front_matter or []):
+            if not fm:
+                continue
+            # skip pure running-heads like "E.\n[1913 Webster]"
+            if isinstance(fm, str) and re.match(
+                r"^[A-Z]\.\s*(\[1913 Webster\])?\s*$", fm
+            ):
+                continue
+            # dedupe by quote text (structured) or full string
+            key = fm.get("text") if isinstance(fm, dict) else fm
+            existing = {
+                (x.get("text") if isinstance(x, dict) else x)
+                for x in dict_front_matter
+            }
+            if key in existing:
+                continue
+            dict_front_matter.append(fm)
+        print(f"  {letter}: {len(entries)} entries"
+              f", other_markers={extras or '[]'}",
+              file=sys.stderr)
 
-    # JSON
-    out_dir = os.path.dirname(os.path.abspath(args.output))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    print(f"Writing {args.output} ({len(all_entries)} entries) ...", file=sys.stderr)
     kw = {"ensure_ascii": False, **({"indent": 2} if args.pretty else {})}
-    if args.output.endswith(".gz"):
-        with gzip.open(args.output, "wt", encoding="utf-8") as fh:
-            json.dump(all_entries, fh, **kw)
-    else:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            json.dump(all_entries, fh, **kw)
 
-    # SQLite FTS
-    if args.db:
-        print(f"Writing {args.db} ...", file=sys.stderr)
-        db_dir = os.path.dirname(os.path.abspath(args.db))
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        conn = create_db(args.db)
-        for i, e in enumerate(all_entries, 1):
-            blob = search_blob(e)
-            conn.execute(
-                """INSERT INTO entries (
-                    id, headword, headword_full, letter, homograph,
-                    part_of_speech, pronunciation, field, etymology,
-                    search_text, raw_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    i,
-                    e.get("headword") or "",
-                    e.get("headword_full"),
-                    e.get("letter"),
-                    e.get("homograph"),
-                    e.get("part_of_speech"),
-                    e.get("pronunciation"),
-                    e.get("field"),
-                    e.get("etymology"),
-                    blob,
-                    json.dumps(e, ensure_ascii=False),
-                ),
-            )
-        conn.commit()
-        print("  Optimizing FTS ...", file=sys.stderr)
-        conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('optimize')")
-        conn.commit()
-        conn.close()
+    # front_matter.json — once, at the beginning of the dictionary
+    fm_path = os.path.join(out_dir, "front_matter.json")
+    fm_obj = {"front_matter": dict_front_matter}
+    print(f"Writing {fm_path} ({len(dict_front_matter)} item(s)) ...", file=sys.stderr)
+    with open(fm_path, "w", encoding="utf-8") as fh:
+        json.dump(fm_obj, fh, **kw)
+
+    # Per-letter JSON files only (no bulky combined JSON).
+    #   { "section_marker": "A", "entries": [...] }
+    per_letter_paths: List[str] = []
+    for letter in letters:
+        if letter not in by_letter:
+            continue
+        payload = by_letter[letter]
+        pl_path = os.path.join(out_dir, f"gcide_{letter}.json")
+        n_ent = len(payload["entries"])
+        print(f"Writing {pl_path} (section_marker={payload['section_marker']}, "
+              f"{n_ent} entries) ...",
+              file=sys.stderr)
+        with open(pl_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, **kw)
+        per_letter_paths.append(pl_path)
 
     print(f"Writing {log_path} ...", file=sys.stderr)
     write_log(log_events, len(all_entries), log_path)
@@ -976,12 +989,13 @@ def main():
         f"Done. {len(all_entries)} entries, {len(log_events)} log events, {elapsed}s.",
         file=sys.stderr,
     )
-    print(
-        f"  JSON : {args.output}\n"
-        + (f"  DB   : {args.db}\n" if args.db else "")
-        + f"  Log  : {log_path}",
-        file=sys.stderr,
-    )
+    summary = f"  front_matter : {fm_path}\n"
+    if per_letter_paths:
+        summary += f"  Per-letter   : {len(per_letter_paths)} files "
+        summary += f"({os.path.basename(per_letter_paths[0])} … "
+        summary += f"{os.path.basename(per_letter_paths[-1])})\n"
+    summary += f"  Log          : {log_path}"
+    print(summary, file=sys.stderr)
 
 
 if __name__ == "__main__":
