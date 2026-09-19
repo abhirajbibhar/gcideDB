@@ -73,7 +73,6 @@ def from_log(log_path: Path) -> None:
     text = log_path.read_text(encoding="utf-8", errors="replace")
     # match: <colbreak/  →  6 occurrences   OR  entities": ["colbreak"]
     names = set(re.findall(r"<([A-Za-z0-9]+)/\s*→", text))
-    names |= set(re.findall(r'"entities":\s*\[([^\]]+)\]', text) and [])
     for m in re.finditer(r'"entities":\s*\[(.*?)\]', text):
         for e in re.findall(r'"([^"]+)"', m.group(1)):
             names.add(e)

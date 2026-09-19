@@ -190,14 +190,33 @@ def scan_sources(gcide_dir: Path, letters: Optional[Set[str]] = None) -> Dict[st
 # Load parsed export
 # ---------------------------------------------------------------------------
 def load_json_keys(json_path: Path) -> Tuple[Counter, Dict[str, Dict[str, Any]]]:
+    """Load keys from either per-letter JSON or flat JSON array.
+
+    Per-letter format (from gcide_build.py):
+      {"section_marker": "A", "entries": [{...}, ...]}
+
+    Flat format (legacy):
+      [{headword: ...}, ...]
+    """
     data = json.loads(json_path.read_text(encoding="utf-8"))
+
+    # Accept both flat list and per-letter section object
+    if isinstance(data, dict) and "entries" in data:
+        # Single per-letter file
+        entries = data["entries"]
+    elif isinstance(data, list):
+        entries = data
+    else:
+        # Unknown format, try iterating
+        entries = data if isinstance(data, list) else []
+
     keys: Counter = Counter()
     examples: Dict[str, Dict[str, Any]] = {}
-    for entry in data:
+    for entry in entries:
         candidates = []
         if entry.get("headword"):
             candidates.append(entry["headword"])
-        for h in entry.get("headwords") or []:
+        for h in entry.get("alt_headwords") or []:
             candidates.append(h)
         for e in entry.get("ents") or []:
             candidates.append(e)
@@ -295,17 +314,23 @@ def compare(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Reverse-check GCIDE JSON/DB vs CIDE.* sources")
-    ap.add_argument("--gcide-dir", type=Path, default=Path("/home/workdir/artifacts/gcide-0.54"))
-    ap.add_argument("--json", type=Path, help="Parsed JSON from gcide_to_json_db.py")
+    ap.add_argument("--gcide-dir", type=Path, default=Path("./gcide-0.54"))
+    ap.add_argument("--json", type=Path, help="Parsed JSON from gcide_build.py (per-letter or flat)")
     ap.add_argument("--db", type=Path, help="Parsed SQLite DB")
     ap.add_argument("--letters", type=str, default="", help="e.g. E,A")
     ap.add_argument("--prefer", choices=("ent", "hw"), default="ent",
                     help="Ground-truth tag in source (default: ent)")
-    ap.add_argument("--out-report", type=Path, default=Path("/home/workdir/artifacts/gcide_missing.jsonl"),
-                    help="JSONL of missing headwords")
-    ap.add_argument("--out-summary", type=Path, default=Path("/home/workdir/artifacts/gcide_reverse_summary.txt"))
+    ap.add_argument("--out-report", type=Path, default=None,
+                    help="JSONL of missing headwords (default: gcide_missing.jsonl)")
+    ap.add_argument("--out-summary", type=Path, default=None,
+                    help="Summary text file (default: gcide_reverse_summary.txt)")
     ap.add_argument("--limit-missing", type=int, default=0, help="Cap missing list in report (0=all)")
     args = ap.parse_args()
+    # defaults based on output dir
+    if args.out_report is None:
+        args.out_report = Path("gcide_missing.jsonl")
+    if args.out_summary is None:
+        args.out_summary = Path("gcide_reverse_summary.txt")
 
     if not args.json and not args.db:
         print("Provide --json and/or --db", file=sys.stderr)

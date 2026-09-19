@@ -30,14 +30,17 @@ Sidecar files (same directory as this script):
   authors.json      quote-author → full name
 """
 
-import argparse, gzip, json, os, re, sys, time
+import argparse, gzip, json, os, re, sqlite3, sys, time
 from typing import Any, Dict, List, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _load(fname):
     p = os.path.join(SCRIPT_DIR, fname)
-    return json.load(open(p, encoding='utf-8')) if os.path.isfile(p) else {}
+    if not os.path.isfile(p):
+        return {}
+    with open(p, encoding='utf-8') as f:
+        return json.load(f)
 
 ENTITY_MAP  = _load("entity_map.json")
 WEBCHR_MAP  = {int(k): v for k, v in _load("webchr_map.json").items()} if _load("webchr_map.json") else {}
@@ -283,6 +286,8 @@ def expand_field_label(field_raw: str):
 
 # ── Entry segmentation ────────────────────────────────────────────────────────
 def leading_headwords(ch):
+    """Extract ALL <ent> headwords from the start of a paragraph.
+    Stops at the first non-<ent>/<br>/whitespace node."""
     words = []
     for c in ch:
         if isinstance(c, str) and not c.strip(): continue
@@ -290,6 +295,37 @@ def leading_headwords(ch):
         if is_tag(c, "ent"): words.append(clean(text_of(c["children"]))); continue
         break
     return words
+
+
+def split_multi_ent_paragraph(ch, letter, log=None):
+    """Split a paragraph with multiple leading <ent> tags into separate entries.
+
+    GCIDE source format for shared definitions:
+      <p><ent>Amongst</ent><br/>
+      <ent>Among</ent><br/>
+      <mhw>{ <hw>A*mong"</hw> ...}</mhw> <pos>prep.</pos> <def>...</def></p>
+
+    Both 'Amongst' and 'Among' are valid headwords sharing one definition.
+    This function yields one entry dict per <ent>, each with the same blocks.
+    """
+    # Collect all leading <ent> words and their positions
+    ent_words = []  # [(word, node_index), ...]
+    for i, c in enumerate(ch):
+        if isinstance(c, str) and not c.strip():
+            continue
+        if is_tag(c, "br"):
+            continue
+        if is_tag(c, "ent"):
+            word = clean(text_of(c["children"]))
+            ent_words.append((word, i))
+            continue
+        break  # hit non-ent content
+
+    if len(ent_words) <= 1:
+        return None  # not a multi-ent paragraph
+
+    # All entries share the same content blocks
+    return [(word, ch) for word, _ in ent_words]
 
 def is_section_marker(ch):
     """True for letter running-heads like <centered>A.</centered>, optionally
@@ -351,28 +387,46 @@ def extract_front_quote(ch):
 
 
 def segment_entries(top_nodes, letter, log=None):
+    """Segment top-level nodes into dictionary entries.
+
+    Handles:
+      - Single-<ent> paragraphs (one headword per paragraph)
+      - Multi-<ent> paragraphs (multiple headwords sharing a definition)
+      - Continuation blocks (content appended to current entry)
+      - Section markers and front matter
+    """
     entries, front_matter, section_markers, current = [], [], [], None
     for p in (n for n in top_nodes if is_tag(n, "p")):
         ch = p.get("children", [])
         if is_blank(ch):
-            # Page-number markers — handled, not logged
             continue
         if is_section_marker(ch):
             t = clean(text_of(ch))
             section_markers.append(t)
-            # Section markers become section_marker / other_markers — not logged
             continue
+
         first = first_real(ch)
         if is_tag(first, "ent"):
-            words = leading_headwords(ch)
-            current = {"headword": words[0], "alt_headwords": words[1:] or None,
-                       "letter": letter, "blocks": [ch]}
-            entries.append(current)
+            # Check for multi-<ent> paragraph (e.g. Amongst/Among sharing a def)
+            multi = split_multi_ent_paragraph(ch, letter, log)
+            if multi:
+                # Create one entry per <ent>, all sharing the same blocks
+                for word, block_ch in multi:
+                    entry = {"headword": word, "alt_headwords": None,
+                             "letter": letter, "blocks": [block_ch],
+                             "_shared_def": True}
+                    entries.append(entry)
+                # Set current to last entry (continuations apply to it)
+                current = entries[-1]
+            else:
+                words = leading_headwords(ch)
+                current = {"headword": words[0], "alt_headwords": words[1:] or None,
+                           "letter": letter, "blocks": [ch]}
+                entries.append(current)
         else:
             if current:
                 current["blocks"].append(ch)
             else:
-                # Pre-entry material → structured front matter (not logged)
                 item = extract_front_quote(ch)
                 if item:
                     front_matter.append(item)
@@ -684,6 +738,20 @@ def extract(entry, homograph):
 
     note = "\n".join(note_parts) if note_parts else None
 
+    # Fallback: create a sense for entries with cross-refs/synonyms but no defs
+    if not senses:
+        fallback_def = None
+        if cross_refs:
+            fallback_def = "See " + "; ".join(cross_refs) + "."
+        elif see_also:
+            fallback_def = "See also " + "; ".join(see_also) + "."
+        elif synonyms:
+            fallback_def = "Synonyms: " + synonyms + "."
+        if fallback_def:
+            senses = [{"number": None, "sub_defs": [], "field": None,
+                       "marker": None, "definition": fallback_def,
+                       "examples": [], "quotations": []}]
+
     return {
         "headword":          entry["headword"],
         "headword_full":     headword_full,
@@ -712,7 +780,6 @@ def extract(entry, homograph):
         "antonyms":          ", ".join(antonyms_t) if antonyms_t else None,
         "contrasting":       contrasting or None,
         "usage":             usage or None,
-        "derived_forms":     derived_forms or None,
         "see_also":          see_also or None,
         "cross_refs":        cross_refs or None,
         "alt_spellings":     alt_spells or None,
@@ -841,7 +908,8 @@ def drop_nulls(obj: Any) -> Any:
 
 
 def parse_letter(path, letter, log=None):
-    raw = open(path, encoding="utf-8", errors="replace").read()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
     raw = strip_comments(raw)
     raw = apply_webchr(raw)
     nodes = parse_markup(raw, letter=letter, log=log)
@@ -868,6 +936,161 @@ def attach_authors(entry: Dict[str, Any]) -> None:
         fix_quote(q)
 
 
+def write_sqlite(db_path: str, entries: List[Dict[str, Any]],
+                 front_matter: List[Any]) -> None:
+    """Write entries to a SQLite database optimized for Android apps.
+
+    Schema:
+      entries       — one row per dictionary entry (indexed by headword, letter)
+      senses        — one row per word sense (linked to entries)
+      definitions   — flattened definitions for FTS search
+      front_matter  — dictionary-level front matter
+      abbreviations — field abbreviation expansions
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    cur.executescript("""
+        DROP TABLE IF EXISTS senses;
+        DROP TABLE IF EXISTS definitions;
+        DROP TABLE IF EXISTS entries;
+        DROP TABLE IF EXISTS front_matter;
+        DROP TABLE IF EXISTS abbreviations;
+        DROP TABLE IF EXISTS entries_fts;
+
+        CREATE TABLE entries (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            headword    TEXT NOT NULL,
+            letter      TEXT,
+            homograph   INTEGER DEFAULT 1,
+            headword_full TEXT,
+            alt_headwords TEXT,  -- JSON array
+            pronunciation TEXT,
+            part_of_speech TEXT,
+            field       TEXT,
+            etymology   TEXT,
+            synonyms    TEXT,
+            antonyms    TEXT,
+            usage       TEXT,
+            see_also    TEXT,    -- JSON array
+            cross_refs  TEXT,    -- JSON array
+            alt_spellings TEXT,  -- JSON array
+            sources     TEXT,    -- JSON array
+            note        TEXT,
+            raw_json    TEXT     -- full entry JSON for advanced queries
+        );
+
+        CREATE INDEX idx_entries_headword ON entries(headword);
+        CREATE INDEX idx_entries_letter ON entries(letter);
+        CREATE INDEX idx_entries_pos ON entries(part_of_speech);
+
+        CREATE TABLE senses (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id    INTEGER NOT NULL REFERENCES entries(id),
+            sense_number TEXT,
+            definition  TEXT,
+            field       TEXT,
+            marker      TEXT,
+            examples    TEXT,    -- JSON array
+            quotations  TEXT     -- JSON array
+        );
+
+        CREATE INDEX idx_senses_entry ON senses(entry_id);
+
+        CREATE VIRTUAL TABLE entries_fts USING fts5(
+            entry_id UNINDEXED,
+            headword,
+            definition
+        );
+
+        CREATE TABLE front_matter (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            data TEXT NOT NULL
+        );
+
+        CREATE TABLE abbreviations (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            abbr TEXT NOT NULL,
+            full TEXT NOT NULL
+        );
+        CREATE INDEX idx_abbr ON abbreviations(abbr);
+    """)
+
+    # Insert entries and senses
+    for entry in entries:
+        cur.execute("""
+            INSERT INTO entries (
+                headword, letter, homograph, headword_full, alt_headwords,
+                pronunciation, part_of_speech, field, etymology,
+                synonyms, antonyms, usage, see_also, cross_refs,
+                alt_spellings, sources, note, raw_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            entry.get("headword"),
+            entry.get("letter"),
+            entry.get("homograph", 1),
+            entry.get("headword_full"),
+            json.dumps(entry.get("alt_headwords"), ensure_ascii=False) if entry.get("alt_headwords") else None,
+            entry.get("pronunciation"),
+            entry.get("part_of_speech"),
+            entry.get("field"),
+            entry.get("etymology"),
+            entry.get("synonyms"),
+            entry.get("antonyms"),
+            entry.get("usage"),
+            json.dumps(entry.get("see_also"), ensure_ascii=False) if entry.get("see_also") else None,
+            json.dumps(entry.get("cross_refs"), ensure_ascii=False) if entry.get("cross_refs") else None,
+            json.dumps(entry.get("alt_spellings"), ensure_ascii=False) if entry.get("alt_spellings") else None,
+            json.dumps(entry.get("sources"), ensure_ascii=False) if entry.get("sources") else None,
+            entry.get("note"),
+            json.dumps(entry, ensure_ascii=False),
+        ))
+        entry_id = cur.lastrowid
+
+        for sense in entry.get("senses") or []:
+            cur.execute("""
+                INSERT INTO senses (
+                    entry_id, sense_number, definition, field, marker,
+                    examples, quotations
+                ) VALUES (?,?,?,?,?,?,?)
+            """, (
+                entry_id,
+                sense.get("number"),
+                sense.get("definition"),
+                sense.get("field"),
+                sense.get("marker"),
+                json.dumps(sense.get("examples"), ensure_ascii=False) if sense.get("examples") else None,
+                json.dumps(sense.get("quotations"), ensure_ascii=False) if sense.get("quotations") else None,
+            ))
+
+    # Populate FTS index from entries + senses
+    # Include entries without senses (cross-refs, synonyms-only) using etymology/note
+    cur.execute("""
+        INSERT INTO entries_fts(entry_id, headword, definition)
+        SELECT e.id, e.headword,
+               COALESCE(s.definition, e.etymology, e.note, e.synonyms, '')
+        FROM entries e
+        LEFT JOIN senses s ON s.entry_id = e.id
+        WHERE COALESCE(s.definition, e.etymology, e.note, e.synonyms) IS NOT NULL
+    """)
+
+    # Insert front matter
+    for fm in front_matter:
+        cur.execute("INSERT INTO front_matter (data) VALUES (?)",
+                    (json.dumps(fm, ensure_ascii=False),))
+
+    # Insert abbreviations
+    for abbr, full in ABBREV_MAP.items():
+        cur.execute("INSERT INTO abbreviations (abbr, full) VALUES (?,?)",
+                    (abbr, full))
+
+    conn.commit()
+    n_senses = cur.execute('SELECT COUNT(*) FROM senses').fetchone()[0]
+    conn.close()
+    print(f"  SQLite: {len(entries)} entries, {n_senses} senses, FTS enabled",
+          file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Build production GCIDE JSON for dictionary apps"
@@ -882,6 +1105,8 @@ def main():
     ap.add_argument("--log", default=None, help="Issue log path (default: output_dir/gcide.log)")
     ap.add_argument("--keep-nulls", action="store_true",
                     help="Keep null/empty fields in JSON (default: drop for compact data)")
+    ap.add_argument("--sqlite", default="",
+                    help="Also write SQLite DB (e.g. --sqlite gcide.db). Recommended for Android apps.")
     args = ap.parse_args()
     if args.compact:
         args.pretty = False
@@ -981,6 +1206,14 @@ def main():
             json.dump(payload, fh, **kw)
         per_letter_paths.append(pl_path)
 
+    # SQLite export for mobile apps
+    if args.sqlite:
+        db_path = args.sqlite
+        if not os.path.isabs(db_path):
+            db_path = os.path.join(out_dir, db_path)
+        print(f"Writing SQLite DB {db_path} ...", file=sys.stderr)
+        write_sqlite(db_path, all_entries, dict_front_matter)
+
     print(f"Writing {log_path} ...", file=sys.stderr)
     write_log(log_events, len(all_entries), log_path)
 
@@ -994,6 +1227,8 @@ def main():
         summary += f"  Per-letter   : {len(per_letter_paths)} files "
         summary += f"({os.path.basename(per_letter_paths[0])} … "
         summary += f"{os.path.basename(per_letter_paths[-1])})\n"
+    if args.sqlite:
+        summary += f"  SQLite DB    : {db_path}\n"
     summary += f"  Log          : {log_path}"
     print(summary, file=sys.stderr)
 

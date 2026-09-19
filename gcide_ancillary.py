@@ -17,9 +17,31 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+def load_entity_map():
+    """Load entity map from _dico_maps.json for converting GCIDE entities."""
+    import json as _json
+    maps_path = Path(__file__).resolve().parent / "_dico_maps.json"
+    if maps_path.is_file():
+        try:
+            m = _json.loads(maps_path.read_text(encoding="utf-8"))
+            return m.get("entity", {})
+        except Exception:
+            pass
+    return {}
+
+ENTITY_MAP = load_entity_map()
+
+
+def convert_entities(s: str) -> str:
+    """Convert GCIDE entity references like <egrave/ to Unicode characters."""
+    def repl(m):
+        return ENTITY_MAP.get(m.group(1), m.group(0))
+    return re.sub(r"<([A-Za-z0-9]+)/", repl, s)
+
+
 def strip_htmlish(s: str) -> str:
+    s = convert_entities(s)
     s = re.sub(r"<[^>]+>", "", s)
-    s = re.sub(r"<[A-Za-z0-9]+/", "", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
